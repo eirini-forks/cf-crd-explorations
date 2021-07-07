@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/gorilla/mux"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"net/http"
 	"strings"
 	"time"
@@ -46,7 +48,7 @@ func (a *AppHandler) ShowAppHandler(w http.ResponseWriter, r *http.Request) {
 	// Convert to a list of CFAPIAppResource to match old Cloud Controller Formatting in REST response
 	formattedApps, err := a.getAppHelper(queryParameters)
 	if err != nil {
-		w.WriteHeader(500)
+		a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
 		return
 	}
 
@@ -105,7 +107,7 @@ func (a *AppHandler) ListAppsHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Print the error if K8s client fails
 		w.WriteHeader(500)
-		fmt.Fprintf(w, "%v", err)
+		a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
 		return
 	}
 
@@ -149,7 +151,7 @@ func (a *AppHandler) getAppListFromQuery(queryParameters map[string][]string) ([
 	return matchedApps, nil
 }
 
-// formatQueryParams takes a map of string query parameters and splits any entires with commas in them in-place
+// formatQueryParams takes a map of string query parameters and splits any entries with commas in them in-place
 func formatQueryParams(queryParams map[string][]string) {
 	for key, value := range queryParams {
 		var newParamsList []string
@@ -199,6 +201,7 @@ func formatApp(app *appsv1alpha1.App) CFAPIAppResource {
 
 func (a *AppHandler) CreateAppsHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	ctx := context.Background()
 
 	var appRequest CFAPIAppResourceWithEnvVars
 	err := json.NewDecoder(r.Body).Decode(&appRequest)
@@ -227,19 +230,31 @@ func (a *AppHandler) CreateAppsHandler(w http.ResponseWriter, r *http.Request) {
 			},
 			StringData: appRequest.EnvironmentVariables,
 		}
-		err = a.Client.Create(context.Background(), secretObj)
+		err = a.Client.Create(ctx, secretObj)
 		if err != nil {
 			fmt.Printf("error creating Secret object: %v\n", *secretObj)
-			w.WriteHeader(500)
+			a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
 		}
 
 		envSecret = appGUID + "-env"
 	}
 
+	space := &corev1.Namespace{}
+	err = a.Client.Get(ctx, types.NamespacedName{Name: appRequest.Relationships.Space.Data.GUID}, space)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			a.ReturnFormattedError(w, 404, "NotFound", err.Error(), "10000")
+		} else {
+			fmt.Printf("error fetching Namespace object: %v\n", *space)
+			a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
+		}
+		return
+	}
+
 	app := &appsv1alpha1.App{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        appGUID,
-			Namespace:   appRequest.Relationships.Space.Data.GUID, // how do we ensure that the namespace exists?
+			Namespace:   appRequest.Relationships.Space.Data.GUID,
 			Labels:      appRequest.Metadata.Labels,
 			Annotations: appRequest.Metadata.Annotations,
 		},
@@ -260,7 +275,7 @@ func (a *AppHandler) CreateAppsHandler(w http.ResponseWriter, r *http.Request) {
 	err = a.Client.Create(context.Background(), app)
 	if err != nil {
 		fmt.Printf("error creating App object: %v\n", *app)
-		w.WriteHeader(500)
+		a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
 		return
 	}
 
@@ -309,7 +324,7 @@ func (a *AppHandler) UpdateAppsHandler(w http.ResponseWriter, r *http.Request) {
 	err = a.Client.Update(context.Background(), matchedApps[0])
 	if err != nil {
 		fmt.Printf("error updating App object: %v\n", *matchedApps[0])
-		w.WriteHeader(500)
+		a.ReturnFormattedError(w, 500, "ServerError", err.Error(), "10001")
 		return
 	}
 
@@ -334,4 +349,14 @@ func (a *AppHandler) ReturnFormattedResponse(w http.ResponseWriter, appGUID stri
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	json.NewEncoder(w).Encode(formattedApps[0])
+}
+
+func (a *AppHandler) ReturnFormattedError(w http.ResponseWriter, status int, title, detail, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(CFAPIErrorData{
+		Title:  title,
+		Detail: detail,
+		Code:   code,
+	})
 }
